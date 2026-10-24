@@ -1,3 +1,15 @@
+# No topo do arquivo, adicione:
+from flask_cors import CORS
+import os
+
+# Logo após criar o app:
+app = Flask(__name__, static_folder=None)
+CORS(app)  # Permite que o Netlify chame a API
+
+
+
+
+
 # app.py — dowPerfil.RDS
 # Roda com: python app.py  →  http://localhost:5000
 
@@ -323,8 +335,9 @@ def api_batch_download(job_id):
 
 
 if __name__ == '__main__':
-    print('=' * 55)
-    print('  dowPerfil.RDS')
-    print('  Abra no navegador:  http://localhost:5000')
-    print('=' * 55)
-    app.run(host='127.0.0.1', port=5000, debug=False, threaded=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
+
+
+
+
