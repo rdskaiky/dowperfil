@@ -1,7 +1,7 @@
 # app.py — dowPerfil.RDS backend
-# Deploy: Render | Start: gunicorn app:app
+# Deploy: Render | Start: gunicorn app:app --timeout 120
 
-from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import yt_dlp
 import os
@@ -22,6 +22,19 @@ PROFILES = {}
 JOBS = {}
 PROFILES_TTL = 1800   # 30 min
 JOBS_TTL     = 900    # 15 min
+
+
+# ── Headers de navegador (reforço contra bloqueio) ────────────
+BROWSER_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/131.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+    'Sec-Fetch-Mode': 'navigate',
+}
 
 
 # ── Limpeza automática ─────────────────────────────────────────
@@ -46,7 +59,7 @@ def index():
     return jsonify({
         'status': 'ok',
         'service': 'dowPerfil.RDS backend',
-        'version': '1.0',
+        'version': '1.1',
     })
 
 
@@ -71,16 +84,87 @@ def _normalize_video(entry):
     }
 
 
-def _ydl_opts(limit=None, flat=False):
+def _base_opts(limit=None, flat=False):
+    """Opções base, sem impersonate (usado como fallback)."""
     opts = {
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
         'extract_flat': flat,
+        'http_headers': BROWSER_HEADERS,
+        'socket_timeout': 30,
+        'retries': 3,
+        'fragment_retries': 3,
     }
     if limit:
         opts['playlistend'] = limit
     return opts
+
+
+def _ydl_opts(limit=None, flat=False):
+    """Opções com impersonate; se falhar, quem chamar trata o fallback."""
+    opts = _base_opts(limit=limit, flat=flat)
+    opts['impersonate'] = 'chrome'
+    return opts
+
+
+def _extract_info_with_fallback(url, limit=None, flat=False):
+    """
+    Tenta extrair com impersonate='chrome'. Se o ambiente não tiver
+    curl_cffi ou o servidor rejeitar, tenta de novo sem impersonate.
+    """
+    # 1ª tentativa: com impersonate
+    try:
+        with yt_dlp.YoutubeDL(_ydl_opts(limit=limit, flat=flat)) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e1:
+        err_str = str(e1).lower()
+        # Só cai no fallback se for erro relacionado a impersonate/curl_cffi
+        if 'impersonate' in err_str or 'curl_cffi' in err_str or 'curl-cffi' in err_str:
+            print(f'[fallback] impersonate falhou ({e1}); tentando sem ele.')
+            with yt_dlp.YoutubeDL(_base_opts(limit=limit, flat=flat)) as ydl:
+                return ydl.extract_info(url, download=False)
+        # Outros erros: propaga
+        raise
+
+
+def _download_with_fallback(webpage_url, outtmpl, audio=False):
+    """
+    Baixa um vídeo com impersonate; fallback sem ele se necessário.
+    """
+    def _build_opts(use_impersonate):
+        opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'outtmpl': outtmpl,
+            'http_headers': BROWSER_HEADERS,
+            'socket_timeout': 30,
+            'retries': 3,
+            'fragment_retries': 3,
+        }
+        if use_impersonate:
+            opts['impersonate'] = 'chrome'
+        if audio:
+            opts['format'] = 'bestaudio/best'
+            opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+            }]
+        else:
+            opts['format'] = 'best[ext=mp4]/best'
+        return opts
+
+    try:
+        with yt_dlp.YoutubeDL(_build_opts(True)) as ydl:
+            ydl.download([webpage_url])
+    except Exception as e1:
+        err_str = str(e1).lower()
+        if 'impersonate' in err_str or 'curl_cffi' in err_str or 'curl-cffi' in err_str:
+            print(f'[fallback] download sem impersonate ({e1})')
+            with yt_dlp.YoutubeDL(_build_opts(False)) as ydl:
+                ydl.download([webpage_url])
+        else:
+            raise
 
 
 # ── API: resolver perfil ──────────────────────────────────────
@@ -94,8 +178,7 @@ def api_profile():
         return jsonify({'error': 'Cole o link do perfil.'}), 400
 
     try:
-        with yt_dlp.YoutubeDL(_ydl_opts(limit=limit)) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = _extract_info_with_fallback(url, limit=limit)
 
         if not info:
             return jsonify({'error': 'Perfil não encontrado.'}), 404
@@ -134,7 +217,14 @@ def api_profile():
         })
 
     except Exception as e:
-        return jsonify({'error': f'Falha ao ler perfil: {e}'}), 500
+        msg = str(e)
+        if 'Unexpected response' in msg or '403' in msg or '429' in msg:
+            msg = (
+                'O TikTok bloqueou o acesso do servidor. '
+                'Tente novamente em alguns minutos. '
+                f'Detalhe técnico: {e}'
+            )
+        return jsonify({'error': f'Falha ao ler perfil: {msg}'}), 500
 
 
 # ── API: resolver vídeo único ─────────────────────────────────
@@ -146,8 +236,7 @@ def api_resolve():
         return jsonify({'error': 'Cole o link do vídeo.'}), 400
 
     try:
-        with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = _extract_info_with_fallback(url)
 
         if not info:
             return jsonify({'error': 'Vídeo não encontrado.'}), 404
@@ -176,7 +265,13 @@ def api_resolve():
         })
 
     except Exception as e:
-        return jsonify({'error': f'Falha ao ler vídeo: {e}'}), 500
+        msg = str(e)
+        if 'Unexpected response' in msg or '403' in msg or '429' in msg:
+            msg = (
+                'O TikTok bloqueou o acesso. Tente novamente em alguns minutos. '
+                f'Detalhe: {e}'
+            )
+        return jsonify({'error': f'Falha ao ler vídeo: {msg}'}), 500
 
 
 # ── API: download de um arquivo ───────────────────────────────
@@ -194,18 +289,11 @@ def api_download_one(slug, vid):
     tmpdir = tempfile.mkdtemp(prefix='dowp_')
 
     try:
-        opts = {
-            'quiet': True, 'no_warnings': True,
-            'outtmpl': os.path.join(tmpdir, '%(id)s.%(ext)s'),
-        }
-        if fmt == 'audio':
-            opts['format'] = 'bestaudio/best'
-            opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}]
-        else:
-            opts['format'] = 'best[ext=mp4]/best'
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([video['webpage_url']])
+        _download_with_fallback(
+            webpage_url=video['webpage_url'],
+            outtmpl=os.path.join(tmpdir, '%(id)s.%(ext)s'),
+            audio=(fmt == 'audio'),
+        )
 
         files = [f for f in Path(tmpdir).iterdir() if f.is_file()]
         if not files:
@@ -259,14 +347,12 @@ def api_batch_start():
         try:
             for v in videos:
                 job['current'] = v['title'][:60]
-                opts = {
-                    'quiet': True, 'no_warnings': True,
-                    'format': 'best[ext=mp4]/best',
-                    'outtmpl': os.path.join(tmpdir, f'{v["id"]}.%(ext)s'),
-                }
                 try:
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        ydl.download([v['webpage_url']])
+                    _download_with_fallback(
+                        webpage_url=v['webpage_url'],
+                        outtmpl=os.path.join(tmpdir, f'{v["id"]}.%(ext)s'),
+                        audio=False,
+                    )
                 except Exception as e:
                     print(f'[skip {v["id"]}] {e}')
                 job['done'] += 1
