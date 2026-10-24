@@ -1,19 +1,8 @@
-# No topo do arquivo, adicione:
-from flask_cors import CORS
-import os
-
-# Logo após criar o app:
-app = Flask(__name__, static_folder=None)
-CORS(app)  # Permite que o Netlify chame a API
-
-
-
-
-
-# app.py — dowPerfil.RDS
-# Roda com: python app.py  →  http://localhost:5000
+# app.py — dowPerfil.RDS backend
+# Deploy: Render | Start: gunicorn app:app
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask_cors import CORS
 import yt_dlp
 import os
 import tempfile
@@ -24,11 +13,13 @@ import zipfile
 import uuid
 from pathlib import Path
 
+# ── App + CORS (única instância) ───────────────────────────────
 app = Flask(__name__, static_folder=None)
+CORS(app)
 
-# Cache global
-PROFILES = {}   # slug -> { info, videos, expires_at }
-JOBS = {}       # job_id -> { status, total, done, zip_path, tmpdir, error, expires_at }
+# ── Cache global ───────────────────────────────────────────────
+PROFILES = {}
+JOBS = {}
 PROFILES_TTL = 1800   # 30 min
 JOBS_TTL     = 900    # 15 min
 
@@ -49,15 +40,18 @@ def _cleanup_loop():
 threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
-# ── Página inicial ─────────────────────────────────────────────
+# ── Health check ───────────────────────────────────────────────
 @app.route('/')
 def index():
-    return send_from_directory('.', 'index.html')
+    return jsonify({
+        'status': 'ok',
+        'service': 'dowPerfil.RDS backend',
+        'version': '1.0',
+    })
 
 
 # ── Helpers ───────────────────────────────────────────────────
 def _slug_from_url(url):
-    """Extrai '@usuario' de uma URL de perfil."""
     try:
         path = url.split('?')[0].rstrip('/')
         if '/@' in path:
@@ -223,7 +217,6 @@ def api_download_one(slug, vid):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
-        # send_file já enviou os bytes; apaga depois
         def _clean():
             time.sleep(30)
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -334,10 +327,7 @@ def api_batch_download(job_id):
     return send_file(job['zip_path'], as_attachment=True, download_name=name)
 
 
+# ── Entry point ───────────────────────────────────────────────
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-
-
-
-
