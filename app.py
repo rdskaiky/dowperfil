@@ -11,20 +11,21 @@ import threading
 import time
 import zipfile
 import uuid
+import traceback
 from pathlib import Path
 
-# ── App + CORS (única instância) ───────────────────────────────
+# ── App + CORS ─────────────────────────────────────────────────
 app = Flask(__name__, static_folder=None)
 CORS(app)
 
 # ── Cache global ───────────────────────────────────────────────
 PROFILES = {}
 JOBS = {}
-PROFILES_TTL = 1800   # 30 min
-JOBS_TTL     = 900    # 15 min
+PROFILES_TTL = 1800
+JOBS_TTL     = 900
 
 
-# ── Headers de navegador (reforço contra bloqueio) ────────────
+# ── Headers de navegador ───────────────────────────────────────
 BROWSER_HEADERS = {
     'User-Agent': (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -59,8 +60,17 @@ def index():
     return jsonify({
         'status': 'ok',
         'service': 'dowPerfil.RDS backend',
-        'version': '1.1',
+        'version': '1.2',
+        'curl_cffi_available': _check_curl_cffi(),
     })
+
+
+def _check_curl_cffi():
+    try:
+        import curl_cffi  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -85,7 +95,6 @@ def _normalize_video(entry):
 
 
 def _base_opts(limit=None, flat=False):
-    """Opções base, sem impersonate (usado como fallback)."""
     opts = {
         'quiet': True,
         'no_warnings': True,
@@ -102,7 +111,7 @@ def _base_opts(limit=None, flat=False):
 
 
 def _ydl_opts(limit=None, flat=False):
-    """Opções com impersonate; se falhar, quem chamar trata o fallback."""
+    """Opções com impersonate; quem chamar trata fallback."""
     opts = _base_opts(limit=limit, flat=flat)
     opts['impersonate'] = 'chrome'
     return opts
@@ -110,28 +119,24 @@ def _ydl_opts(limit=None, flat=False):
 
 def _extract_info_with_fallback(url, limit=None, flat=False):
     """
-    Tenta extrair com impersonate='chrome'. Se o ambiente não tiver
-    curl_cffi ou o servidor rejeitar, tenta de novo sem impersonate.
+    Tenta extrair com impersonate='chrome'.
+    Fallback sem impersonate se curl_cffi faltar ou o servidor rejeitar.
     """
-    # 1ª tentativa: com impersonate
     try:
         with yt_dlp.YoutubeDL(_ydl_opts(limit=limit, flat=flat)) as ydl:
             return ydl.extract_info(url, download=False)
     except Exception as e1:
         err_str = str(e1).lower()
-        # Só cai no fallback se for erro relacionado a impersonate/curl_cffi
-        if 'impersonate' in err_str or 'curl_cffi' in err_str or 'curl-cffi' in err_str:
-            print(f'[fallback] impersonate falhou ({e1}); tentando sem ele.')
+        # Impersonate falhou? Tenta sem.
+        if ('impersonate' in err_str or 'curl_cffi' in err_str
+                or 'curl-cffi' in err_str or 'target' in err_str):
+            print(f'[fallback] impersonate falhou ({type(e1).__name__}: {e1})')
             with yt_dlp.YoutubeDL(_base_opts(limit=limit, flat=flat)) as ydl:
                 return ydl.extract_info(url, download=False)
-        # Outros erros: propaga
         raise
 
 
 def _download_with_fallback(webpage_url, outtmpl, audio=False):
-    """
-    Baixa um vídeo com impersonate; fallback sem ele se necessário.
-    """
     def _build_opts(use_impersonate):
         opts = {
             'quiet': True,
@@ -159,12 +164,25 @@ def _download_with_fallback(webpage_url, outtmpl, audio=False):
             ydl.download([webpage_url])
     except Exception as e1:
         err_str = str(e1).lower()
-        if 'impersonate' in err_str or 'curl_cffi' in err_str or 'curl-cffi' in err_str:
-            print(f'[fallback] download sem impersonate ({e1})')
+        if ('impersonate' in err_str or 'curl_cffi' in err_str
+                or 'curl-cffi' in err_str or 'target' in err_str):
+            print(f'[fallback] download sem impersonate ({type(e1).__name__}: {e1})')
             with yt_dlp.YoutubeDL(_build_opts(False)) as ydl:
                 ydl.download([webpage_url])
         else:
             raise
+
+
+def _err_message(e, prefix):
+    """Retorna uma string amigável, mesmo quando str(e) é vazia."""
+    detail = str(e).strip() or f'{type(e).__name__} (sem mensagem)'
+    low = detail.lower()
+    if 'unexpected response' in low or '403' in low or '429' in low:
+        return (
+            f'{prefix}: o TikTok bloqueou o acesso do servidor. '
+            f'Tente de novo em alguns minutos. Detalhe: {detail}'
+        )
+    return f'{prefix}: {detail}'
 
 
 # ── API: resolver perfil ──────────────────────────────────────
@@ -172,28 +190,60 @@ def _download_with_fallback(webpage_url, outtmpl, audio=False):
 def api_profile():
     data = request.get_json() or {}
     url = (data.get('url') or '').strip()
-    limit = max(1, min(int(data.get('limit') or 20), 100))
+    try:
+        limit = max(1, min(int(data.get('limit') or 20), 100))
+    except (TypeError, ValueError):
+        limit = 20
 
     if not url:
         return jsonify({'error': 'Cole o link do perfil.'}), 400
 
     try:
-        info = _extract_info_with_fallback(url, limit=limit)
+        # Para PERFIL, extract_flat='in_playlist' é muito mais leve e
+        # evita que o yt-dlp busque cada vídeo individualmente (anti-bot).
+        info = _extract_info_with_fallback(url, limit=limit, flat='in_playlist')
 
         if not info:
             return jsonify({'error': 'Perfil não encontrado.'}), 404
 
         is_playlist = info.get('_type') == 'playlist'
-        entries = info.get('entries') if is_playlist else [info]
-        entries = [e for e in (entries or []) if e][:limit]
+        entries_raw = info.get('entries') if is_playlist else [info]
+
+        # Força a iteração da LazyList com contexto para logar erros reais
+        entries = []
+        try:
+            for e in (entries_raw or []):
+                if e:
+                    entries.append(e)
+                if len(entries) >= limit:
+                    break
+        except Exception as lazy_err:
+            print(f'[lazy-list-error] {type(lazy_err).__name__}: {lazy_err}')
+            traceback.print_exc()
+            return jsonify({
+                'error': (
+                    'O TikTok retornou uma resposta inesperada ao listar os vídeos. '
+                    'Tente novamente em alguns minutos. '
+                    f'Detalhe: {type(lazy_err).__name__}'
+                )
+            }), 502
 
         if not entries:
-            return jsonify({'error': 'Nenhum vídeo público encontrado neste perfil.'}), 404
+            return jsonify({
+                'error': 'Nenhum vídeo público encontrado neste perfil.'
+            }), 404
 
-        videos = [_normalize_video(e) for e in entries]
+        # Normaliza; completa com webpage_url usando o username se faltar
+        username = _slug_from_url(url) or ''
+        videos = []
+        for e in entries:
+            v = _normalize_video(e)
+            if not v['webpage_url'] and username and v['id']:
+                v['webpage_url'] = f'https://www.tiktok.com/@{username}/video/{v["id"]}'
+            videos.append(v)
 
         profile = {
-            'username': info.get('uploader_id') or info.get('channel') or _slug_from_url(url) or 'perfil',
+            'username': info.get('uploader_id') or info.get('channel') or username or 'perfil',
             'display_name': info.get('uploader') or info.get('channel') or '',
             'avatar': info.get('channel_thumbnail') or '',
             'count': len(videos),
@@ -217,14 +267,8 @@ def api_profile():
         })
 
     except Exception as e:
-        msg = str(e)
-        if 'Unexpected response' in msg or '403' in msg or '429' in msg:
-            msg = (
-                'O TikTok bloqueou o acesso do servidor. '
-                'Tente novamente em alguns minutos. '
-                f'Detalhe técnico: {e}'
-            )
-        return jsonify({'error': f'Falha ao ler perfil: {msg}'}), 500
+        traceback.print_exc()
+        return jsonify({'error': _err_message(e, 'Falha ao ler perfil')}), 500
 
 
 # ── API: resolver vídeo único ─────────────────────────────────
@@ -236,7 +280,7 @@ def api_resolve():
         return jsonify({'error': 'Cole o link do vídeo.'}), 400
 
     try:
-        info = _extract_info_with_fallback(url)
+        info = _extract_info_with_fallback(url, flat=False)
 
         if not info:
             return jsonify({'error': 'Vídeo não encontrado.'}), 404
@@ -265,13 +309,8 @@ def api_resolve():
         })
 
     except Exception as e:
-        msg = str(e)
-        if 'Unexpected response' in msg or '403' in msg or '429' in msg:
-            msg = (
-                'O TikTok bloqueou o acesso. Tente novamente em alguns minutos. '
-                f'Detalhe: {e}'
-            )
-        return jsonify({'error': f'Falha ao ler vídeo: {msg}'}), 500
+        traceback.print_exc()
+        return jsonify({'error': _err_message(e, 'Falha ao ler vídeo')}), 500
 
 
 # ── API: download de um arquivo ───────────────────────────────
@@ -285,6 +324,9 @@ def api_download_one(slug, vid):
     if not video:
         return jsonify({'error': 'Vídeo não encontrado.'}), 404
 
+    if not video['webpage_url']:
+        return jsonify({'error': 'URL do vídeo não disponível.'}), 400
+
     fmt = request.args.get('format', 'video')
     tmpdir = tempfile.mkdtemp(prefix='dowp_')
 
@@ -297,13 +339,14 @@ def api_download_one(slug, vid):
 
         files = [f for f in Path(tmpdir).iterdir() if f.is_file()]
         if not files:
-            return jsonify({'error': 'Download falhou.'}), 500
+            return jsonify({'error': 'Download falhou no servidor.'}), 500
 
         f = files[0]
         return send_file(str(f), as_attachment=True, download_name=f.name)
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        traceback.print_exc()
+        return jsonify({'error': _err_message(e, 'Falha no download')}), 500
     finally:
         def _clean():
             time.sleep(30)
@@ -324,7 +367,7 @@ def api_batch_start():
         return jsonify({'error': 'Nenhum vídeo selecionado.'}), 400
 
     profile = PROFILES[slug]
-    videos = [v for v in profile['videos'] if v['id'] in ids]
+    videos = [v for v in profile['videos'] if v['id'] in ids and v['webpage_url']]
     if not videos:
         return jsonify({'error': 'Vídeos não encontrados.'}), 404
 
@@ -354,7 +397,7 @@ def api_batch_start():
                         audio=False,
                     )
                 except Exception as e:
-                    print(f'[skip {v["id"]}] {e}')
+                    print(f'[skip {v["id"]}] {type(e).__name__}: {e}')
                 job['done'] += 1
 
             files = [f for f in Path(tmpdir).iterdir() if f.is_file()]
@@ -378,8 +421,9 @@ def api_batch_start():
             job['current'] = ''
 
         except Exception as e:
+            traceback.print_exc()
             job['status'] = 'error'
-            job['error'] = str(e)
+            job['error'] = str(e) or f'{type(e).__name__}: erro desconhecido'
 
     threading.Thread(target=_worker, daemon=True).start()
     return jsonify({'job_id': job_id, 'total': len(videos)})
